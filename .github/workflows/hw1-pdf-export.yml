@@ -1,0 +1,114 @@
+name: Export HW1 HTML to PDF
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hw1-pdf-export.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-pdf:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Chromium, Chinese fonts, and PDF tools
+        run: |
+          python -m pip install --disable-pip-version-check playwright==1.55.0 pypdf==6.1.1
+          python -m playwright install --with-deps chromium
+          sudo apt-get install -y fonts-noto-cjk
+      - name: Render the three HTML assignments and merge into one PDF
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from pypdf import PdfReader, PdfWriter
+          from playwright.sync_api import sync_playwright
+
+          root = Path("HW1")
+          sources = [
+              ("1_4a.html", "1.4(a)"),
+              ("1_4b.html", "1.4(b)"),
+              ("HW1_5abc.html", "1.5(a), 1.5(b), 1.5(c)"),
+          ]
+          css = """
+          @page { size: A4; margin: 13mm 11mm; }
+          html, body { max-width: 100% !important; }
+          body { margin: 0 !important; }
+          .rtcContent { padding: 0 !important; }
+          .eoOutputWrapper, .CodeBlock {
+            width: 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+          }
+          .CodeBlock { display: block !important; }
+          .S3, .S4, .S5, pre, code {
+            white-space: pre-wrap !important;
+            overflow-wrap: anywhere !important;
+          }
+          img, svg, table { max-width: 100% !important; }
+          img { height: auto !important; break-inside: avoid; }
+          """
+          destination = root / "HW1_combined.pdf"
+          writer = PdfWriter()
+          first_pages = []
+          with TemporaryDirectory() as tmp, sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              for filename, section in sources:
+                  src = root / filename
+                  if not src.is_file():
+                      raise FileNotFoundError(src)
+                  page = browser.new_page(viewport={"width": 1240, "height": 900})
+                  page.goto(src.resolve().as_uri(), wait_until="load")
+                  page.emulate_media(media="screen")
+                  page.add_style_tag(content=css)
+                  broken = page.locator("img").evaluate_all(
+                      "(items) => items.filter(img => !img.complete || img.naturalWidth === 0).length"
+                  )
+                  if broken:
+                      raise RuntimeError(f"{filename}: {broken} image(s) failed to render")
+                  part = Path(tmp) / f"{src.stem}.pdf"
+                  page.pdf(
+                      path=str(part), format="A4",
+                      prefer_css_page_size=True, print_background=True,
+                      display_header_footer=False, scale=0.96
+                  )
+                  page.close()
+                  reader = PdfReader(str(part))
+                  if not reader.pages:
+                      raise RuntimeError(f"{filename}: produced empty PDF")
+                  first_pages.append((section, len(writer.pages)))
+                  writer.append(reader, import_outline=False)
+                  print(f"{filename}: {len(reader.pages)} pages")
+              browser.close()
+          for section, start in first_pages:
+              writer.add_outline_item(section, start)
+          writer.add_metadata({"/Title": "Signals and Systems - Week 1 Homework",
+                               "/Subject": "Combined HTML exports: 1.4(a), 1.4(b), 1.5(a,b,c)"})
+          with destination.open("wb") as handle:
+              writer.write(handle)
+          verify = PdfReader(str(destination))
+          if len(verify.pages) < 3:
+              raise RuntimeError("Merged output has fewer than three pages")
+          text_length = sum(len(page.extract_text() or "") for page in verify.pages)
+          if text_length < 400:
+              raise RuntimeError(f"Unexpectedly little extractable text: {text_length}")
+          print(f"VERIFIED {destination}: {len(verify.pages)} pages, "
+                f"{text_length} extracted text chars, {destination.stat().st_size} bytes")
+          PY
+      - name: Commit and push the combined PDF
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HW1/HW1_combined.pdf
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add combined Week 1 Signals and Systems PDF'
+            git push
+          fi
